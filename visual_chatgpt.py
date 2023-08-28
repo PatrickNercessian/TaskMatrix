@@ -14,10 +14,7 @@ import math
 import numpy as np
 import argparse
 import inspect
-import tempfile
-from transformers import CLIPSegProcessor, CLIPSegForImageSegmentation
 from transformers import pipeline, BlipProcessor, BlipForConditionalGeneration, BlipForQuestionAnswering
-from transformers import AutoImageProcessor, UperNetForSemanticSegmentation
 
 from diffusers import StableDiffusionPipeline, StableDiffusionInpaintPipeline, StableDiffusionInstructPix2PixPipeline
 from diffusers import EulerAncestralDiscreteScheduler
@@ -29,12 +26,15 @@ from controlnet_aux import OpenposeDetector, MLSDdetector, HEDdetector
 from langchain.agents.initialize import initialize_agent
 from langchain.agents.tools import Tool
 from langchain.chains.conversation.memory import ConversationBufferMemory
+from langchain.document_loaders import DirectoryLoader, TextLoader
+from langchain.embeddings.openai import OpenAIEmbeddings
 from langchain.llms.openai import OpenAI
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.vectorstores import FAISS
 
 # Grounding DINO
 import groundingdino.datasets.transforms as T
 from groundingdino.models import build_model
-from groundingdino.util import box_ops
 from groundingdino.util.slconfig import SLConfig
 from groundingdino.util.utils import clean_state_dict, get_phrases_from_posmap
 
@@ -137,6 +137,7 @@ Thought: Do I need to use a tool? {agent_scratchpad}
 
 os.makedirs('image', exist_ok=True)
 
+OPENAI_EMBEDDINGS = OpenAIEmbeddings()
 
 def seed_everything(seed):
     random.seed(seed)
@@ -288,10 +289,10 @@ class Text2Image:
              description="useful when you want to generate an image from a user input text and save it to a file. "
                          "like: generate an image of an object or something, or generate an image that includes some objects. "
                          "The input to this tool should be a string, representing the text used to generate image. ")
-    def inference(self, text):
+    def inference(self, text, num_inference_steps=10):
         image_filename = os.path.join('image', f"{str(uuid.uuid4())[:8]}.png")
         prompt = text + ', ' + self.a_prompt
-        image = self.pipe(prompt, negative_prompt=self.n_prompt).images[0]
+        image = self.pipe(prompt, negative_prompt=self.n_prompt, num_inference_steps=num_inference_steps).images[0]
         image.save(image_filename)
         print(
             f"\nProcessed Text2Image, Input Text: {text}, Output Image: {image_filename}")
@@ -1515,8 +1516,8 @@ class ConversationBot:
                           'suffix': SUFFIX}, )
         return gr.update(visible = True), gr.update(visible = False), gr.update(placeholder=place), gr.update(value=label_clear)
 
-    def run_text(self, text, state):
-        self.agent.memory.buffer = cut_dialogue_history(self.agent.memory.buffer, keep_last_n_words=500)
+    def run_text(self, text, state, keep_last_n_words=500):
+        self.agent.memory.buffer = cut_dialogue_history(self.agent.memory.buffer, keep_last_n_words=keep_last_n_words)
         res = self.agent({"input": text.strip()})
         res['output'] = res['output'].replace("\\", "/")
         response = re.sub('(image/[-\w]*.png)', lambda m: f'![](file={m.group(0)})*{m.group(0)}*', res['output'])
@@ -1551,33 +1552,86 @@ class ConversationBot:
               f"Current Memory: {self.agent.memory.buffer}")
         return state, state, f'{txt} {image_filename} '
 
+def inject_state_and_memory(input: str, output: str, state: list, memory):
+    state.append((input, output))
+    memory.save_context({"input": input}, {"output": output})
 
 if __name__ == '__main__':
     if not os.path.exists("checkpoints"):
         os.mkdir("checkpoints")
     parser = argparse.ArgumentParser()
     parser.add_argument('--load', type=str, default="ImageCaptioning_cuda:0,Text2Image_cuda:0")
+    parser.add_argument('--no-gradio', action='store_true')
+    parser.add_argument('--test-sneakers', action='store_true')
     args = parser.parse_args()
     load_dict = {e.split('_')[0].strip(): e.split('_')[1].strip() for e in args.load.split(',')}
     bot = ConversationBot(load_dict=load_dict)
-    with gr.Blocks(css="#chatbot .overflow-y-auto{height:500px}") as demo:
-        lang = gr.Radio(choices = ['Chinese','English'], value=None, label='Language')
-        chatbot = gr.Chatbot(elem_id="chatbot", label="Visual ChatGPT")
-        state = gr.State([])
-        with gr.Row(visible=False) as input_raws:
-            with gr.Column(scale=0.7):
-                txt = gr.Textbox(show_label=False, placeholder="Enter text and press enter, or upload an image").style(
-                    container=False)
-            with gr.Column(scale=0.15, min_width=0):
-                clear = gr.Button("Clear")
-            with gr.Column(scale=0.15, min_width=0):
-                btn = gr.UploadButton(label="🖼️",file_types=["image"])
+    if args.no_gradio:
+        bot.init_agent("English")
 
-        lang.change(bot.init_agent, [lang], [input_raws, lang, txt, clear])
-        txt.submit(bot.run_text, [txt, state], [chatbot, state])
-        txt.submit(lambda: "", None, txt)
-        btn.upload(bot.run_image, [btn, state, txt, lang], [chatbot, state, txt])
-        clear.click(bot.memory.clear)
-        clear.click(lambda: [], None, chatbot)
-        clear.click(lambda: [], None, state)
-    demo.launch(server_name="0.0.0.0", server_port=7861)
+        if args.test_sneakers:  # TODO remove
+            folder = "../sneakers_folder"
+            folder_description = "The folder contains several images of the best selling sneakers of all time, as well as descriptions of them."
+            intended_result = "Please generate a new sneaker design that looks amazing."
+            conversion_explanation = "Use the images specified to generate images of a sneaker, and use the text descriptions to help your generation."
+        else:
+            folder = input("Enter the folder path: ")
+            folder_description = input("Describe the information stored in the folder: ")
+            intended_result = input("What is the intended result of the task? ")
+            conversion_explanation = input ("How should the folder's information be used to generate that intended result (e.g. are you feeding research on different colours, shapes, recent trends, etc...)? ")
+
+        state = []
+        state.append(("Hello, I'd like to generate an image based on the images and text information in a folder.", "Okay, please provide all of the images from the folder."))
+        for filename in os.listdir(folder):
+            if filename.endswith(".jpg") or filename.endswith(".png"):
+                image_path = os.path.join(folder, filename)
+                with open(image_path, 'rb') as f:
+                    bot.run_image(f, state, "", "English")
+
+        inject_state_and_memory("Do you have any questions about this task?", "Yes, please describe the information stored in the folder.", state, bot.agent.memory)
+        inject_state_and_memory(folder_description, "Okay, what is the intended result of the task?", state, bot.agent.memory)
+        inject_state_and_memory(intended_result, "Okay, how should the folder's information be used to generate that intended result?", state, bot.agent.memory)
+        inject_state_and_memory(conversion_explanation, "Okay, now please provide the relevant parts of the text info from the folder.", state, bot.agent.memory)
+
+        vector_db_folder = os.path.join(folder, "vector_db")
+        if os.path.exists(vector_db_folder):
+            vector_store = FAISS.load_local(vector_db_folder, OPENAI_EMBEDDINGS)
+        else:
+            docs = RecursiveCharacterTextSplitter(
+                chunk_size=1000
+            ).split_documents(
+                DirectoryLoader(folder, glob="*.txt", loader_cls=TextLoader).load()
+            )
+            vector_store = FAISS.from_documents(docs, OPENAI_EMBEDDINGS)
+            vector_store.save_local(vector_db_folder)
+
+        embedding_search = f"The informations tored in the folder is described as follows:\n{folder_description}\n\nThe intended result of the task is described as follows:\n{intended_result}\n\nThe folder's information should be used to generate that intended result as follows:\n{conversion_explanation}\n\n"
+        snippets = "\n\n\n".join([x.page_content for x in vector_store.similarity_search(embedding_search, k=5)])
+        inject_state_and_memory(f"Okay, here are the relevant snippets from the text info in the folder:\n\n{snippets}", "Great, thank you. Let me know when you'd like me to generate the image.", state, bot.agent.memory)
+
+        bot.run_text("Okay, please generate the image now.", state, keep_last_n_words=2500)
+
+
+
+    else:
+        with gr.Blocks(css="#chatbot .overflow-y-auto{height:500px}") as demo:
+            lang = gr.Radio(choices = ['Chinese','English'], value=None, label='Language')
+            chatbot = gr.Chatbot(elem_id="chatbot", label="Visual ChatGPT")
+            state = gr.State([])
+            with gr.Row(visible=False) as input_raws:
+                with gr.Column(scale=0.7):
+                    txt = gr.Textbox(show_label=False, placeholder="Enter text and press enter, or upload an image").style(
+                        container=False)
+                with gr.Column(scale=0.15, min_width=0):
+                    clear = gr.Button("Clear")
+                with gr.Column(scale=0.15, min_width=0):
+                    btn = gr.UploadButton(label="🖼️",file_types=["image"])
+
+            lang.change(bot.init_agent, [lang], [input_raws, lang, txt, clear])
+            txt.submit(bot.run_text, [txt, state], [chatbot, state])
+            txt.submit(lambda: "", None, txt)
+            btn.upload(bot.run_image, [btn, state, txt, lang], [chatbot, state, txt])
+            clear.click(bot.memory.clear)
+            clear.click(lambda: [], None, chatbot)
+            clear.click(lambda: [], None, state)
+        demo.launch(server_name="0.0.0.0", server_port=7861)

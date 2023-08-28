@@ -28,3 +28,5 @@ torchmetrics
 transformers
 webdataset
 yapf
+tiktoken==0.4.0
+faiss-cpu==1.7.4
