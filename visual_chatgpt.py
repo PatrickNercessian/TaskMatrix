@@ -1611,8 +1611,10 @@ if __name__ == '__main__':
         snippets = "\n\n\n".join([x.page_content for x in vector_store.similarity_search(embedding_search, k=5)])
         inject_state_and_memory(f"Okay, here are the relevant snippets from the text info in the folder:\n\n{snippets}", "Great, thank you. Let me know when you'd like me to generate the image.", state, bot.agent.memory)
 
+        buffer_before = bot.agent.memory.buffer
         for i in range(num_generations_expected):
             bot.run_text("Okay, please generate the image now.", state, keep_last_n_words=2500)
+            bot.agent.memory.buffer = buffer_before
 
     else:
         with gr.Blocks(css="#chatbot .overflow-y-auto{height:500px}") as demo:
