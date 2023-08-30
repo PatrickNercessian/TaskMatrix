@@ -1574,11 +1574,13 @@ if __name__ == '__main__':
             folder_description = "The folder contains several images of the best selling sneakers of all time, as well as descriptions of them."
             intended_result = "Please generate a new sneaker design that looks amazing."
             conversion_explanation = "Use the images specified to generate images of a sneaker, and use the text descriptions to help your generation."
+            num_generations_expected = 2
         else:
             folder = input("Enter the folder path: ")
             folder_description = input("Describe the information stored in the folder: ")
             intended_result = input("What is the intended result of the task? ")
             conversion_explanation = input ("How should the folder's information be used to generate that intended result (e.g. are you feeding research on different colours, shapes, recent trends, etc...)? ")
+            num_generations_expected = int(input("How many generations do you expect to be needed to complete the task? Response only with the number please. ").strip())
 
         state = []
         state.append(("Hello, I'd like to generate an image based on the images and text information in a folder.", "Okay, please provide all of the images from the folder."))
@@ -1605,13 +1607,12 @@ if __name__ == '__main__':
             vector_store = FAISS.from_documents(docs, OPENAI_EMBEDDINGS)
             vector_store.save_local(vector_db_folder)
 
-        embedding_search = f"The informations tored in the folder is described as follows:\n{folder_description}\n\nThe intended result of the task is described as follows:\n{intended_result}\n\nThe folder's information should be used to generate that intended result as follows:\n{conversion_explanation}\n\n"
+        embedding_search = f"The information stored in the folder is described as follows:\n{folder_description}\n\nThe intended result of the task is described as follows:\n{intended_result}\n\nThe folder's information should be used to generate that intended result as follows:\n{conversion_explanation}\n\n"
         snippets = "\n\n\n".join([x.page_content for x in vector_store.similarity_search(embedding_search, k=5)])
         inject_state_and_memory(f"Okay, here are the relevant snippets from the text info in the folder:\n\n{snippets}", "Great, thank you. Let me know when you'd like me to generate the image.", state, bot.agent.memory)
 
-        bot.run_text("Okay, please generate the image now.", state, keep_last_n_words=2500)
-
-
+        for i in range(num_generations_expected):
+            bot.run_text("Okay, please generate the image now.", state, keep_last_n_words=2500)
 
     else:
         with gr.Blocks(css="#chatbot .overflow-y-auto{height:500px}") as demo:
