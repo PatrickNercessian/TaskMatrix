@@ -1,7 +1,8 @@
+# coding: utf-8
+
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-# coding: utf-8
 import os
 import gradio as gr
 import random
@@ -25,10 +26,11 @@ from controlnet_aux import OpenposeDetector, MLSDdetector, HEDdetector
 
 from langchain.agents.initialize import initialize_agent
 from langchain.agents.tools import Tool
-from langchain.chains.conversation.memory import ConversationBufferMemory
+from langchain.chains.conversation.memory import ConversationStringBufferMemory
 from langchain.document_loaders import DirectoryLoader, TextLoader
 from langchain.embeddings.openai import OpenAIEmbeddings
 from langchain.llms.openai import OpenAI
+from langchain.chat_models.openai import ChatOpenAI
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.vectorstores import FAISS
 
@@ -289,7 +291,7 @@ class Text2Image:
              description="useful when you want to generate an image from a user input text and save it to a file. "
                          "like: generate an image of an object or something, or generate an image that includes some objects. "
                          "The input to this tool should be a string, representing the text used to generate image. ")
-    def inference(self, text, num_inference_steps=10):
+    def inference(self, text, num_inference_steps=50):
         image_filename = os.path.join('image', f"{str(uuid.uuid4())[:8]}.png")
         prompt = text + ', ' + self.a_prompt
         image = self.pipe(prompt, negative_prompt=self.n_prompt, num_inference_steps=num_inference_steps).images[0]
@@ -1464,7 +1466,7 @@ class BackgroundRemoving:
 
 
 class ConversationBot:
-    def __init__(self, load_dict):
+    def __init__(self, load_dict, model=None, chat_model=None):
         # load_dict = {'VisualQuestionAnswering':'cuda:0', 'ImageCaptioning':'cuda:1',...}
         print(f"Initializing VisualChatGPT, load_dict={load_dict}")
         if 'ImageCaptioning' not in load_dict:
@@ -1492,8 +1494,16 @@ class ConversationBot:
                 if e.startswith('inference'):
                     func = getattr(instance, e)
                     self.tools.append(Tool(name=func.name, description=func.description, func=func))
-        self.llm = OpenAI(temperature=0)
-        self.memory = ConversationBufferMemory(memory_key="chat_history", output_key='output')
+        if model is None and chat_model is None:
+            self.llm = OpenAI(temperature=0)
+            print("Using model text-davinci-003")
+        elif model is not None:
+            self.llm = OpenAI(temperature=0, model_name=model)
+            print(f"Using model {model}")
+        elif chat_model is not None:
+            self.llm = ChatOpenAI(temperature=0, model_name=model)
+            print(f"Using model {model}")
+        self.memory = ConversationStringBufferMemory(memory_key="chat_history", output_key='output')
 
     def init_agent(self, lang):
         self.memory.clear() #clear previous history
@@ -1563,9 +1573,11 @@ if __name__ == '__main__':
     parser.add_argument('--load', type=str, default="ImageCaptioning_cuda:0,Text2Image_cuda:0")
     parser.add_argument('--no-gradio', action='store_true')
     parser.add_argument('--test-sneakers', action='store_true')
+    parser.add_argument('--model', type=str, default=None)
+    parser.add_argument('--chat-model', type=str, default=None)
     args = parser.parse_args()
     load_dict = {e.split('_')[0].strip(): e.split('_')[1].strip() for e in args.load.split(',')}
-    bot = ConversationBot(load_dict=load_dict)
+    bot = ConversationBot(load_dict=load_dict, model=args.model, chat_model=args.chat_model)
     if args.no_gradio:
         bot.init_agent("English")
 
@@ -1573,8 +1585,8 @@ if __name__ == '__main__':
             folder = "../sneakers_folder"
             folder_description = "The folder contains several images of the best selling sneakers of all time, as well as descriptions of them."
             intended_result = "Please generate a new sneaker design that looks amazing."
-            conversion_explanation = "Use the images specified to generate images of a sneaker, and use the text descriptions to help your generation."
-            num_generations_expected = 2
+            conversion_explanation = "Use the images IN THE FOLDER to create edges and use those lines to generate images of a sneaker, and use the text descriptions to help your generation."
+            num_generations_expected = 1
         else:
             folder = input("Enter the folder path: ")
             folder_description = input("Describe the information stored in the folder: ")
@@ -1600,9 +1612,9 @@ if __name__ == '__main__':
             vector_store = FAISS.load_local(vector_db_folder, OPENAI_EMBEDDINGS)
         else:
             docs = RecursiveCharacterTextSplitter(
-                chunk_size=1000
+                chunk_size=500
             ).split_documents(
-                DirectoryLoader(folder, glob="*.txt", loader_cls=TextLoader).load()
+                DirectoryLoader(folder, glob="*.txt", loader_cls=TextLoader, loader_kwargs={"encoding": "utf-8"}).load()
             )
             vector_store = FAISS.from_documents(docs, OPENAI_EMBEDDINGS)
             vector_store.save_local(vector_db_folder)

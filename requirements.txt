@@ -1,4 +1,4 @@
-langchain==0.0.101
+langchain==0.0.225
 torch==1.13.1
 torchvision==0.14.1
 wget==3.2
@@ -9,7 +9,8 @@ basicsr
 controlnet-aux
 diffusers
 einops
-gradio
+fastapi==0.101.1
+gradio==3.40.1
 imageio
 imageio-ffmpeg
 invisible-watermark
