@@ -17,7 +17,7 @@ import argparse
 import inspect
 from transformers import pipeline, BlipProcessor, BlipForConditionalGeneration, BlipForQuestionAnswering
 
-from diffusers import StableDiffusionPipeline, StableDiffusionInpaintPipeline, StableDiffusionInstructPix2PixPipeline
+from diffusers import StableDiffusionPipeline, StableDiffusionInpaintPipeline, StableDiffusionInstructPix2PixPipeline, StableDiffusionImg2ImgPipeline
 from diffusers import EulerAncestralDiscreteScheduler
 from diffusers import StableDiffusionControlNetPipeline, ControlNetModel, UniPCMultistepScheduler
 from diffusers.pipelines.stable_diffusion import StableDiffusionSafetyChecker
@@ -271,6 +271,28 @@ class InstructPix2Pix:
         updated_image_path = get_new_image_name(image_path, func_name="pix2pix")
         image.save(updated_image_path)
         print(f"\nProcessed InstructPix2Pix, Input Image: {image_path}, Instruct Text: {text}, "
+              f"Output Image: {updated_image_path}")
+        return updated_image_path
+    
+class Img2Img:
+    def __init__(self, device):
+        print(f"Initializing Img2Img to {device}")
+        self.device = device
+        self.torch_dtype = torch.float16 if 'cuda' in device else torch.float32
+
+        self.pipe = StableDiffusionImg2ImgPipeline.from_pretrained("runwayml/stable-diffusion-v1-5",
+                                                                   safety_checker=StableDiffusionSafetyChecker.from_pretrained('CompVis/stable-diffusion-safety-checker'),
+                                                                   torch_dtype=self.torch_dtype).to(device)
+        self.pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(self.pipe.scheduler.config)
+
+    def inference(self, image_path):
+        """Change style of image."""
+        print("===>Starting Img2Img Inference")
+        original_image = Image.open(image_path)
+        image = self.pipe(image=original_image, num_inference_steps=40).images[0]
+        updated_image_path = get_new_image_name(image_path, func_name="img2img")
+        image.save(updated_image_path)
+        print(f"\nProcessed Img2Img, Input Image: {image_path}, "
               f"Output Image: {updated_image_path}")
         return updated_image_path
 
