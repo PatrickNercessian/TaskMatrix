@@ -16,6 +16,10 @@ import numpy as np
 import argparse
 import inspect
 from transformers import pipeline, BlipProcessor, BlipForConditionalGeneration, BlipForQuestionAnswering
+import requests
+import json
+
+import boto3
 
 from diffusers import StableDiffusionPipeline, StableDiffusionInpaintPipeline, StableDiffusionInstructPix2PixPipeline, StableDiffusionImg2ImgPipeline
 from diffusers import EulerAncestralDiscreteScheduler
@@ -140,6 +144,11 @@ Thought: Do I need to use a tool? {agent_scratchpad}
 os.makedirs('image', exist_ok=True)
 
 OPENAI_EMBEDDINGS = OpenAIEmbeddings()
+CSM_URL = "https://api.csm.ai:5566/image-to-3d-sessions"
+CSM_HEADERS = {
+    'x-api-key': '1F2086412406434388c40EA2F000d349',
+    'Content-Type': 'application/json'
+}
 
 def seed_everything(seed):
     random.seed(seed)
@@ -285,11 +294,19 @@ class Img2Img:
                                                                    torch_dtype=self.torch_dtype).to(device)
         self.pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(self.pipe.scheduler.config)
 
-    def inference(self, image_path):
+    @prompts(name="Change Style Of Image",
+             description="useful when you want to change the style of the image. "
+                         "like: change the angle of the image, change the color of the image, or change the style of the image. "
+                         "The input to this tool should be a comma separated string of two, "
+                         "representing the image_path and the text. ")
+    def inference(self, inputs):
         """Change style of image."""
         print("===>Starting Img2Img Inference")
+        split_inputs = inputs.split(",")
+        image_path, text = split_inputs[0], ','.join(split_inputs[1:])
+
         original_image = Image.open(image_path)
-        image = self.pipe(image=original_image, num_inference_steps=40).images[0]
+        image = self.pipe(prompt=text, image=original_image, num_inference_steps=40).images[0]
         updated_image_path = get_new_image_name(image_path, func_name="img2img")
         image.save(updated_image_path)
         print(f"\nProcessed Img2Img, Input Image: {image_path}, "
@@ -1588,6 +1605,65 @@ def inject_state_and_memory(input: str, output: str, state: list, memory):
     state.append((input, output))
     memory.save_context({"input": input}, {"output": output})
 
+def upload_to_google_drive(image_path: str):
+    gauth = GoogleAuth()
+    drive = GoogleDrive(gauth)
+
+    uploaded = drive.CreateFile({'title': os.path.basename(image_path)})
+    uploaded.SetContentFile(image_path)
+    uploaded.Upload()
+
+    # Change the file permissions to public
+    uploaded.InsertPermission({
+        'type': 'anyone',
+        'value': 'anyone',
+        'role': 'reader'
+    })
+
+    # Get the file URL
+    file_url = f"https://drive.google.com/uc?id={uploaded.get('id')}"
+    print(f'Uploaded file with ID {uploaded.get("id")}')
+    print(f'File URL: {file_url}')
+
+    return file_url
+
+def generate_3d_csm(file_url: str):
+
+    payload = json.dumps({ "image_url": file_url })
+    response = requests.request("POST", CSM_URL, headers=CSM_HEADERS, data=payload)
+    print("3D Session Response: ", response)
+    print("3D Session Response Text: ", response.text)
+
+    session_code = response.json()['data']['session_code']
+    detail_url = CSM_URL + f"/{session_code}"
+    detail_response = requests.request("GET", detail_url, headers=CSM_HEADERS, data={})
+    print("3D Detail Response: ", detail_response)
+    print("3D Detail Response Text: ", detail_response.text)
+
+    preview_url = CSM_URL + f"/get-3d/preview/{session_code}"
+    preview_payload = json.dumps({ "model_version": "1.0 " })
+    preview_response = requests.request("POST", preview_url, headers=CSM_HEADERS, data=preview_payload)
+    print("3D Preview Response: ", preview_response)
+    print("3D Preview Response Text: ", preview_response.text)
+
+    print("\n\nKEEP THE SESSION CODE FOR REFINE AND MESH. Use it like \"python visual_chatgpt --refine-3d <session_code>\" or \"python visual_chatgpt --get-mesh-3d <session_code>\"")
+    print("SESSION CODE:", session_code)
+
+def refine_3d_csm(session_code: str):
+    refine_url = CSM_URL + f"/get-3d/refine/{session_code}"
+    refine_payload = json.dumps({})
+    refine_response = requests.request("POST", refine_url, headers=CSM_HEADERS, data=refine_payload)
+    print("3D Refine Response: ", refine_response)
+    print("3D Refine Response Text: ", refine_response.text)
+
+def get_3d_mesh_csm(session_code: str):
+    mesh_url = CSM_URL + f"/get-mesh/{session_code}"
+    response = requests.request("GET", mesh_url, headers=CSM_HEADERS, data="")
+    print("3D Mesh Response: ", response)
+    print("3D Mesh Response Text: ", response.text)
+
+
+
 if __name__ == '__main__':
     if not os.path.exists("checkpoints"):
         os.mkdir("checkpoints")
@@ -1597,6 +1673,10 @@ if __name__ == '__main__':
     parser.add_argument('--test-sneakers', action='store_true')
     parser.add_argument('--model', type=str, default=None)
     parser.add_argument('--chat-model', type=str, default=None)
+    parser.add_argument('--generate-3d', action='store_true')
+    parser.add_argument('--s3-bucket', type=str, default=None)
+    parser.add_argument('--refine-3d', type=str, default=None)
+    parser.add_argument('--get-mesh-3d', type=str, default=None)
     args = parser.parse_args()
     load_dict = {e.split('_')[0].strip(): e.split('_')[1].strip() for e in args.load.split(',')}
     bot = ConversationBot(load_dict=load_dict, model=args.model, chat_model=args.chat_model)
@@ -1645,11 +1725,37 @@ if __name__ == '__main__':
         snippets = "\n\n\n".join([x.page_content for x in vector_store.similarity_search(embedding_search, k=5)])
         inject_state_and_memory(f"Okay, here are the relevant snippets from the text info in the folder:\n\n{snippets}", "Great, thank you. Let me know when you'd like me to generate the image.", state, bot.agent.memory)
 
+        if args.generate_3d:
+            session = boto3.Session(profile_name='giovanni')
+            s3 = session.client('s3')
+            bucket_name = args.s3_bucket
+            if bucket_name is None:
+                bucket_name = input("Enter the name of the S3 bucket you'd like to use: ")
+            s3_region = input("Enter the region of the S3 bucket you'd like to use (for eu-central-1, just click enter): ")
+            if s3_region == "":
+                s3_region = "eu-central-1"
+
         buffer_before = bot.agent.memory.buffer
         for i in range(num_generations_expected):
             bot.run_text("Okay, please generate the image now.", state, keep_last_n_words=2500)
-            bot.agent.memory.buffer = buffer_before
 
+            if args.generate_3d:
+                image_matches = re.findall('(image/[-\w]*.png)', bot.agent.memory.buffer)
+                if len(image_matches) > 0:
+                    recent_image = image_matches[-1]
+                    recent_imagename = recent_image.split('/')[-1]
+                    try:
+                        with open(recent_image, 'rb') as f:
+                            s3.upload_fileobj(f, bucket_name, recent_imagename)
+                    except Exception as e:
+                        print("Error uploading to S3: ", e)
+                    generate_3d_csm(f"https://{bucket_name}.s3.{s3_region}.amazonaws.com/{recent_imagename}")
+
+            bot.agent.memory.buffer = buffer_before
+    elif args.refine_3d:
+        refine_3d_csm(args.refine_3d)
+    elif args.get_mesh_3d:
+        get_3d_mesh_csm(args.get_mesh_3d)
     else:
         with gr.Blocks(css="#chatbot .overflow-y-auto{height:500px}") as demo:
             lang = gr.Radio(choices = ['Chinese','English'], value=None, label='Language')
